@@ -1,0 +1,3 @@
+interface:
+  display_name: "Bilibili Study Notes"
+  short_description: "Make Obsidian review notes from Bilibili videos"
