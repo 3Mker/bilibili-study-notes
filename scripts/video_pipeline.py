@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 VAULT_ENV = "BILIBILI_NOTES_VAULT"
+CURRENT_WORKDIR = None
 
 
 def configured_vault() -> Path:
@@ -31,7 +32,21 @@ TIME_RE = re.compile(r"(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?")
 
 
 def call(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if args and args[0] == "yt-dlp" and "--ignore-config" not in args:
+        args = [args[0], "--ignore-config", *args[1:]]
+    process = subprocess.Popen(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    while True:
+        try:
+            stdout,stderr=process.communicate(timeout=15)
+            break
+        except subprocess.TimeoutExpired:
+            if CURRENT_WORKDIR is not None:
+                from progress import emit
+                state=json.loads((CURRENT_WORKDIR/'progress.json').read_text())['current']
+                emit(CURRENT_WORKDIR,state['phase'],tool=args[0],message="Tool still running; preserve this workdir if interrupted")
+        except BaseException:
+            process.terminate();process.wait();raise
+    result = subprocess.CompletedProcess(args,process.returncode,stdout,stderr)
     if check and result.returncode:
         tail = (result.stderr or result.stdout)[-1800:].strip()
         raise RuntimeError(f"{args[0]} failed ({result.returncode}): {tail}")
@@ -63,7 +78,7 @@ def parse_subtitle(path: Path) -> list[dict]:
             ]
         return []
     rows = []
-    pattern = re.compile(r"(\d{2}:\d{2}:\d{2}[.,]\d{1,3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{1,3})")
+    pattern = re.compile(r"((?:\d{2}:)?\d{2}:\d{2}[.,]\d{1,3})\s*-->\s*((?:\d{2}:)?\d{2}:\d{2}[.,]\d{1,3})")
     for block in re.split(r"\n\s*\n", raw.replace("\r\n", "\n")):
         lines = block.splitlines()
         idx = next((i for i, line in enumerate(lines) if pattern.search(line)), None)
@@ -136,22 +151,6 @@ def get_media(url: str, workdir: Path, browser: str | None) -> Path:
     return files[0]
 
 
-def local_asr(media: Path, workdir: Path, model: Path) -> list[dict]:
-    cli = shutil.which("whisper-cli")
-    if not cli:
-        raise RuntimeError("whisper-cli is missing; install whisper.cpp")
-    if not model.is_file():
-        raise RuntimeError(f"Local multilingual ASR model is missing: {model}")
-    wav = workdir / "audio.wav"
-    call(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(media), "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)])
-    prefix = workdir / "asr"
-    call([cli, "-m", str(model), "-f", str(wav), "-l", "zh", "-oj", "-of", str(prefix), "-np"])
-    output = prefix.with_suffix(".json")
-    if not output.is_file():
-        raise RuntimeError("whisper-cli did not produce JSON transcription")
-    return transcript_from_asr(output)
-
-
 def scene_times(media: Path, duration: float) -> list[float]:
     result = call(["ffmpeg", "-hide_banner", "-loglevel", "info", "-i", str(media), "-vf", "select=gt(scene\\,0.20),showinfo", "-an", "-f", "null", "-"], check=False)
     if result.returncode:
@@ -182,6 +181,25 @@ def extract_frame(media: Path, seconds: float, output: Path, *, preview: bool) -
 
 
 def prepare(args: argparse.Namespace) -> None:
+    from qwen_mlx_asr import job_lock, atomic_json
+    workdir = args.workdir.expanduser().resolve()
+    with job_lock(workdir, ".pipeline.lock"):
+        request = {"url": args.url, "hotwords": args.hotwords, "chunk_seconds": args.chunk_seconds,
+                   "series_part": args.series_part, "browser": args.browser}
+        identity = workdir / "prepare_request.json"
+        if identity.exists() and json.loads(identity.read_text()) != request:
+            raise ValueError("Preparation input differs; preserve this workdir and use a new one")
+        if not identity.exists():
+            # Existing workdirs may contain subtitles/media from another request.
+            if any(p.name != ".pipeline.lock" for p in workdir.iterdir()):
+                raise ValueError("Unbound existing workdir; use a new workdir")
+            atomic_json(identity, request)
+        from progress import emit
+        emit(workdir,"prepare",recovery="Repeat identical prepare after failure; after manifest exists continue select/draft/coverage.")
+        _prepare(args)
+
+
+def _prepare(args: argparse.Namespace) -> None:
     parsed = urlparse(args.url)
     if parsed.hostname not in {"www.bilibili.com", "bilibili.com", "m.bilibili.com", "b23.tv"}:
         raise ValueError("Expected a Bilibili video URL")
@@ -192,7 +210,10 @@ def prepare(args: argparse.Namespace) -> None:
     meta_cmd = ["yt-dlp", "--no-playlist", "--dump-single-json"]
     if args.browser:
         meta_cmd += ["--cookies-from-browser", args.browser]
+    from progress import emit
+    emit(workdir, "metadata")
     meta = json.loads(call(meta_cmd + [args.url]).stdout)
+    emit(workdir, "metadata", "completed")
     bvid_match = BVID_RE.search(str(meta.get("id", ""))) or BVID_RE.search(str(meta.get("webpage_url", "")))
     if not bvid_match:
         raise RuntimeError("Could not resolve a Bilibili BV ID")
@@ -204,20 +225,22 @@ def prepare(args: argparse.Namespace) -> None:
     if duration > args.max_minutes * 60:
         raise RuntimeError(f"Video is {stamp(duration)}; limit is {args.max_minutes} minutes")
     source_url = f"https://www.bilibili.com/video/{bvid}/?p={part}"
+    emit(workdir, "subtitles")
     rows, subtitle_name = find_subtitles(source_url, workdir, args.browser, meta)
+    emit(workdir, "subtitles", "completed", segments=len(rows))
+    emit(workdir, "download")
     media = get_media(source_url, workdir, args.browser)
+    emit(workdir, "download", "completed", media=media.name)
     has_subtitles = sum(len(row["text"]) for row in rows) >= 50
-    source = "subtitle" if has_subtitles else ("local-asr-qwen3-mlx-0.6b" if args.asr_backend == "qwen3-mlx" else "local-asr-whisper-small")
+    source = "subtitle" if has_subtitles else "local-asr-qwen3-mlx-0.6b"
     if not has_subtitles:
-        if args.asr_backend == "qwen3-mlx":
-            from qwen_mlx_asr import transcribe as qwen_transcribe
-            rows = qwen_transcribe(media, workdir, hotwords=args.hotwords)
-        else:
-            rows = local_asr(media, workdir, args.model.expanduser())
+        from qwen_mlx_asr import transcribe as qwen_transcribe
+        rows = qwen_transcribe(media, workdir, hotwords=args.hotwords, chunk_seconds=args.chunk_seconds)
     if not rows or sum(len(row["text"]) for row in rows) < 30:
         raise RuntimeError("Transcript is empty or too short; no note was published")
     transcript = "\n".join(f"[{stamp(row['start'])}] {row['text']}" for row in rows) + "\n"
     (workdir / "transcript.md").write_text(transcript, encoding="utf-8")
+    emit(workdir, "frames")
     times = candidate_times(duration, scene_times(media, duration))
     preview_dir = workdir / "candidates"
     preview_dir.mkdir(exist_ok=True)
@@ -225,10 +248,12 @@ def prepare(args: argparse.Namespace) -> None:
     for index, seconds in enumerate(times, start=1):
         name = f"candidate-{index:02d}.jpg"
         extract_frame(media, seconds, preview_dir / name, preview=True)
+        emit(workdir, "frames", completed=index, total=len(times))
         candidates.append({"index": index, "seconds": seconds, "timestamp": stamp(seconds), "file": f"candidates/{name}"})
     columns = min(4, len(candidates))
     rows = math.ceil(len(candidates) / columns)
     call(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-pattern_type", "glob", "-i", str(preview_dir / "*.jpg"), "-vf", f"tile={columns}x{rows}", "-frames:v", "1", str(workdir / "contact-sheet.jpg")])
+    emit(workdir, "frames", "completed", completed=len(times), total=len(times))
     title = str(meta.get("title") or "")
     title_series_match = re.search(r"P(\d+)】?$", title.strip(), re.I)
     series_part = args.series_part or (int(title_series_match.group(1)) if title_series_match else None)
@@ -341,6 +366,10 @@ def publish(args: argparse.Namespace) -> None:
     manifest = load_manifest(workdir)
     note = workdir / "note.md"
     body = note.read_text(encoding="utf-8")
+    from coverage import validate as validate_coverage
+    validate_coverage(workdir)
+    from quality import validate as validate_quality
+    validate_quality(workdir)
     if "## 完整转写" not in body or "## 自测问题" not in body or not body.startswith("---\n"):
         raise ValueError("Note needs frontmatter, review questions, and full transcript")
     frontmatter_match = re.match(r"\A---\n(.*?)\n---\n", body, re.S)
@@ -373,6 +402,19 @@ def publish(args: argparse.Namespace) -> None:
         raise ValueError("Frontmatter part differs from Bilibili page part")
     if manifest.get("series_part") is not None and property_value("series_part") != manifest["series_part"]:
         raise ValueError("Frontmatter series_part differs from manifest")
+    import yaml
+    metadata = yaml.safe_load(frontmatter)
+    tags = metadata.get("tags", [])
+    required_tags = [f"UP主/{manifest['creator']}"]
+    if metadata.get("series"):
+        required_tags.append(f"系列/{metadata['series']}")
+    if args.category == "History":
+        dynasties = metadata.get("dynasties")
+        if not isinstance(dynasties, list) or any(not isinstance(d, str) for d in dynasties):
+            raise ValueError("History notes require a dynasties list")
+        required_tags.extend(f"朝代/{d}" for d in dynasties)
+    if not isinstance(tags, list) or any(tag not in tags for tag in required_tags):
+        raise ValueError("Missing creator, series, or dynasty tags")
     full_text = body.split("## 完整转写", 1)[1]
     if len(re.sub(r"\s|!\[[^]]*\]\([^)]*\)", "", full_text)) < 100:
         raise ValueError("Full transcript section is too short")
@@ -407,18 +449,28 @@ def publish(args: argparse.Namespace) -> None:
     if frame_pairs:
         shared_assets.mkdir(parents=True, exist_ok=True)
     copied = []
+    note_created = False
     try:
         for staged_frame, target_frame in frame_pairs:
             with staged_frame.open("rb") as source, target_frame.open("xb") as destination:
                 copied.append(target_frame)
                 shutil.copyfileobj(source, destination)
         with target_note.open("x", encoding="utf-8") as file:
+            note_created = True
             file.write(body)
     except Exception:
+        if note_created:
+            target_note.unlink(missing_ok=True)
         for target_frame in copied:
             target_frame.unlink(missing_ok=True)
         raise
     result = {"note": str(target_note), "frames": len(manifest["selected"]), "transcript_source": manifest["transcript_source"]}
+    if getattr(args, "keep_media", False):
+        verify_publication(workdir, manifest, args.category)
+        result["publication_verified"] = True
+        result["media_retained"] = True
+        print(json.dumps(result, ensure_ascii=False))
+        return
     try:
         result["removed_staging_files"] = cleanup_staging(workdir, manifest, args.category)
     except (OSError, ValueError) as exc:
@@ -426,7 +478,7 @@ def publish(args: argparse.Namespace) -> None:
     print(json.dumps(result, ensure_ascii=False))
 
 
-def cleanup_staging(workdir: Path, manifest: dict, category: str) -> list[str]:
+def verify_publication(workdir: Path, manifest: dict, category: str) -> None:
     """Remove bulky generated media only after verifying the published note and frames."""
     slug = manifest["id"]
     if not re.fullmatch(r"BV[0-9A-Za-z]{10}-P[0-9]{2,}", slug):
@@ -441,6 +493,9 @@ def cleanup_staging(workdir: Path, manifest: dict, category: str) -> list[str]:
         staged_frame, published_frame = frame_paths(workdir, slug, row, vault)
         if not staged_frame.is_file() or not published_frame.is_file() or staged_frame.read_bytes() != published_frame.read_bytes():
             raise ValueError(f"Published frame is missing or differs: {row['file']}; staging files were kept")
+def cleanup_staging(workdir: Path, manifest: dict, category: str) -> list[str]:
+    """Remove generated media only after exact publication readback."""
+    verify_publication(workdir, manifest, category)
     removed = []
     media_names = {"audio.m4a", "audio.wav", "contact-sheet.jpg"}
     for path in workdir.iterdir():
@@ -468,13 +523,13 @@ def cleanup(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    from progress import emit
     commands = parser.add_subparsers(dest="command", required=True)
     prep = commands.add_parser("prepare")
     prep.add_argument("url")
     prep.add_argument("--workdir", type=Path, required=True)
     prep.add_argument("--browser", choices=["chrome", "edge", "firefox", "safari"])
-    prep.add_argument("--model", type=Path, default=Path.home() / ".cache/bilibili-study-notes/ggml-small-q5_1.bin")
-    prep.add_argument("--asr-backend", choices=["qwen3-mlx", "whisper-small"], default="qwen3-mlx")
+    prep.add_argument("--chunk-seconds", type=int, default=60)
     prep.add_argument("--hotwords", default="", help="Comma-separated verified terms for Qwen3-ASR context")
     prep.add_argument("--series-part", type=int, help="Series installment number when the title does not end in P<N>")
     prep.add_argument("--max-minutes", type=int, default=90)
@@ -490,15 +545,58 @@ def main() -> None:
     publication.add_argument("workdir", type=Path)
     publication.add_argument("--category", choices=["History", "Literature"], required=True)
     publication.add_argument("--validate-only", action="store_true", help="Check the staged note without writing to Obsidian")
+    publication.add_argument("--keep-media", action="store_true", help="Retain source media for user-requested follow-up tests")
     publication.set_defaults(func=publish)
     cleaning = commands.add_parser("cleanup", help="Remove generated media after verifying the published note and frames")
     cleaning.add_argument("workdir", type=Path)
     cleaning.add_argument("--category", choices=["History", "Literature"], required=True)
     cleaning.set_defaults(func=cleanup)
+    review = commands.add_parser("coverage", help="Create pending source-segment review checklist")
+    review.add_argument("workdir", type=Path)
+    def make_coverage(args):
+        from coverage import create
+        print(create(args.workdir.expanduser().resolve()))
+    review.set_defaults(func=make_coverage)
+    status = commands.add_parser("status", help="Show latest stages, failures and recovery instructions")
+    status.add_argument("workdir", type=Path)
+    status.set_defaults(func=lambda a: print((a.workdir/'progress.json').read_text()))
+    quality_cmd = commands.add_parser("quality", help="Audit grounded inventory and flag source doubts")
+    quality_cmd.add_argument("workdir", type=Path)
+    def audit_quality(a):
+        from quality import audit
+        report=audit(a.workdir)
+        print(json.dumps(report,ensure_ascii=False))
+        if not report["gate"]["valid"]:raise ValueError("Quality review blocked; see quality-report.json: "+report["gate"]["error"])
+    quality_cmd.set_defaults(func=audit_quality)
+    init_quality=commands.add_parser("quality-init",help="Create pending item review for a legacy staged transcript; never migrate historical notes")
+    init_quality.add_argument("workdir",type=Path)
+    def create_quality(a):
+        from quality import create
+        print(create(a.workdir))
+    init_quality.set_defaults(func=create_quality)
+    boundary=commands.add_parser("boundaries",help="Generate listen-around-boundary checklist without deleting text")
+    boundary.add_argument("workdir",type=Path)
+    def inspect_boundaries(a):
+        from boundaries import inspect
+        print(json.dumps(inspect(a.workdir),ensure_ascii=False))
+    boundary.set_defaults(func=inspect_boundaries)
+    stage = commands.add_parser("stage", help="Report externally performed writing or review checkpoint")
+    stage.add_argument("workdir",type=Path); stage.add_argument("--phase",choices=["writing","review"],required=True)
+    stage.add_argument("--state",choices=["running","completed","failed"],required=True);stage.add_argument("--message",required=True)
+    stage.add_argument("--completed",type=int);stage.add_argument("--total",type=int)
+    stage.set_defaults(func=lambda a: emit(a.workdir,a.phase,a.state,message=a.message,completed=a.completed,total=a.total))
     args = parser.parse_args()
+    global CURRENT_WORKDIR
+    CURRENT_WORKDIR=args.workdir.expanduser().resolve()
     try:
+        tracked=args.command not in {"status","stage","quality"}
+        if tracked and args.command!="prepare":emit(args.workdir,args.command,recovery="Repeat identical command; prepared manifest: continue select/draft/coverage. Never overwrite existing published output.")
         args.func(args)
-    except (RuntimeError, ValueError, FileExistsError, KeyError, json.JSONDecodeError) as exc:
+        if tracked:emit(args.workdir,args.command,"completed")
+    except (RuntimeError, ValueError, OSError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+        if getattr(args,"workdir",None) is not None:
+            failed_phase=json.loads((args.workdir/'progress.json').read_text())['current']['phase'] if (args.workdir/'progress.json').exists() else args.command
+            emit(args.workdir,args.command,"failed",failure_point=failed_phase,failure=str(exc),recovery="Preserve workdir. Fix reported error, repeat identical command. For stale review renew hashes and item review; for published target inspect existing output.")
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
 
